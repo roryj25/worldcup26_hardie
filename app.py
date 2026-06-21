@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import datetime
 import requests
 
@@ -153,7 +153,8 @@ WC_TEAM_MAP: dict = {
     "Egypt": "EGY",                          "Czech Republic": "CZE",
     "Czechia": "CZE",                        "Panama": "PAN",
     "Iraq": "IRQ",                           "Curaçao": "CUW",
-    "Curacao": "CUW",                        "New Zealand": "NZL",
+    "Curacao": "CUW",                        "Cura\xc3\xa7ao": "CUW",
+    "New Zealand": "NZL",
     "Spain": "ESP",                          "Netherlands": "NLD",
     "Belgium": "BEL",                        "Austria": "AUT",
     "Turkey": "TUR",                         "Ivory Coast": "CIV",
@@ -223,10 +224,82 @@ def _fetch_wc_scorers(api_key: str) -> list:
         return []
 
 
-def _derive_live_data(matches: list) -> tuple:
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_wc_standings(api_key: str) -> list:
+    if not api_key:
+        return []
+    try:
+        r = requests.get(
+            f"{_FD_BASE}/competitions/WC/standings",
+            headers={"X-Auth-Token": api_key}, timeout=10,
+        )
+        r.raise_for_status()
+        return r.json().get("standings", [])
+    except Exception:
+        return []
+
+
+def _derive_provisional_group_pts(standings: list) -> dict:
+    """Return {iso: 10} for teams currently in qualifying positions per API group standings.
+
+    Deduplicates by group name (most recent entry wins). Uses the API's position field
+    directly — this preserves FIFA head-to-head tiebreakers that the API has already
+    applied. When two teams share pos=2 with no pos=3 listed (a genuine tie before their
+    direct match), the lower-ranked of the two is used as the group's third-place
+    representative so the cross-group pool always has 12 teams.
+    Positions 1–2 qualify automatically; best 8 third-place teams also qualify.
+    """
+    per_group: dict = {}
+    for entry in standings:
+        if entry.get("type") != "TOTAL":
+            continue
+        group = entry.get("group", "")
+        if group:
+            per_group[group] = entry
+
+    pts: dict = {}
+    third_place: list = []
+
+    for entry in per_group.values():
+        by_pos: dict = {}
+        for row in (entry.get("table") or []):
+            iso = WC_TEAM_MAP.get((row.get("team") or {}).get("name", ""))
+            if not iso:
+                continue
+            team = {
+                "iso": iso,
+                "played": row.get("playedGames", 0),
+                "points": row.get("points", 0),
+                "gd": row.get("goalDifference", 0),
+                "gf": row.get("goalsFor", 0),
+            }
+            by_pos.setdefault(row.get("position"), []).append(team)
+
+        # Auto-qualifiers: positions 1 and 2
+        for pos in (1, 2):
+            for team in by_pos.get(pos, []):
+                if team["played"] > 0:
+                    pts[team["iso"]] = 10
+
+        # Third-place pool entry for cross-group ranking
+        if 3 in by_pos:
+            third_place.extend(by_pos[3])
+        elif len(by_pos.get(2, [])) > 1:
+            # Two teams tied at pos=2 (haven't played each other yet) — no pos=3 exists.
+            # Use the lower-ranked as this group's provisional third-place representative.
+            tied = sorted(by_pos[2], key=lambda t: (-t["points"], -t["gd"], -t["gf"]))
+            third_place.append(tied[-1])
+
+    third_place.sort(key=lambda x: (-x["points"], -x["gd"], -x["gf"]))
+    for t in third_place[:8]:
+        pts[t["iso"]] = 10
+    return pts
+
+
+def _derive_live_data(matches: list, standings: list = None) -> tuple:
     """Returns (country_points, country_status) from match results.
 
-    Group stage: no points until a team appears in a R32 fixture (confirmed advance).
+    Group stage: provisional 10 pts for teams in qualifying positions per API standings.
     Knockout: winner promoted, loser frozen at that stage's points and marked 'out'.
     """
     pts: dict = {}
@@ -271,6 +344,11 @@ def _derive_live_data(matches: list) -> tuple:
             if l_iso:
                 pts[l_iso] = max(pts.get(l_iso, 0), _STAGE_PTS[stage])
                 stat[l_iso] = "out"
+
+    # Group stage: award provisional pts from standings when no LAST_32 fixtures exist yet
+    if not in_knockout and standings:
+        for iso, p in _derive_provisional_group_pts(standings).items():
+            pts[iso] = max(pts.get(iso, 0), p)
 
     # Once LAST_32 fixtures exist the group stage is done — remaining picks are eliminated
     if in_knockout:
@@ -322,10 +400,12 @@ def _get_person_fixtures(matches: list, person_isos: set) -> list:
 # ── Fetch live data and overwrite COUNTRY_POINTS / COUNTRY_STATUS ─────────────
 _matches_data = _fetch_wc_matches(_api_key)
 _scorers_data = _fetch_wc_scorers(_api_key)
-COUNTRY_POINTS, COUNTRY_STATUS = _derive_live_data(_matches_data)
+_standings_data = _fetch_wc_standings(_api_key)
+COUNTRY_POINTS, COUNTRY_STATUS = _derive_live_data(_matches_data, _standings_data)
 for _iso, _bonus in _derive_golden_boot(_scorers_data).items():
     COUNTRY_POINTS[_iso] = COUNTRY_POINTS.get(_iso, 0) + _bonus
 _live_ok = bool(_api_key and _matches_data)
+_in_group_stage = _live_ok and not any(m.get("stage") == "LAST_32" for m in _matches_data)
 
 iso_index: dict = {}
 for person, data in PEOPLE.items():
@@ -637,6 +717,10 @@ for col, (person, data) in zip(banner_cols, PEOPLE.items()):
     with col:
         total = person_total(person)
         color = data["color"]
+        prov_note = (
+            "<div style='font-size:10px;font-weight:400;opacity:0.82;margin-top:3px;'>"
+            "~ incl. provisional pts</div>"
+        ) if _in_group_stage else ""
         # Keep flat bottom so it connects visually to list when expanded
         st.markdown(
             f"<div style='background:{color};color:white;"
@@ -644,6 +728,7 @@ for col, (person, data) in zip(banner_cols, PEOPLE.items()):
             f"text-align:center;font-size:15px;font-weight:700;"
             f"letter-spacing:0.3px;box-shadow:0 2px 10px rgba(0,0,0,0.18);'>"
             f"{person}&nbsp;&nbsp;&middot;&nbsp;&nbsp;{total} pts"
+            f"{prov_note}"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -664,9 +749,12 @@ if st.session_state.show_countries:
                 cp = COUNTRY_POINTS.get(iso, 0)
                 pts_col = data["color"] if cp > 0 else "#9ca3af"
                 is_out = COUNTRY_STATUS.get(iso, "in") == "out"
-                status_text = "OUT" if is_out else "IN"
-                status_color = "#ef4444" if is_out else "#16a34a"
-                status_bg = "#fee2e2" if is_out else "#dcfce7"
+                if is_out:
+                    status_text, status_color, status_bg = "OUT", "#ef4444", "#fee2e2"
+                elif _in_group_stage and cp > 0:
+                    status_text, status_color, status_bg = "PROV", "#b45309", "#fef3c7"
+                else:
+                    status_text, status_color, status_bg = "IN", "#16a34a", "#dcfce7"
                 rows += (
                     f"<div style='display:flex;justify-content:space-between;"
                     f"align-items:center;padding:7px 10px;"
@@ -733,6 +821,7 @@ div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button:hover 
         if st.button("🔄 Refresh", key="refresh_data", use_container_width=True):
             _fetch_wc_matches.clear()
             _fetch_wc_scorers.clear()
+            _fetch_wc_standings.clear()
             st.rerun()
     with _tcol:
         st.markdown(
@@ -936,3 +1025,4 @@ st.markdown(
     f"{scoring_items_html}</div></div></div>",
     unsafe_allow_html=True,
 )
+
