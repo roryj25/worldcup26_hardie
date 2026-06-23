@@ -242,12 +242,10 @@ def _fetch_wc_standings(api_key: str) -> list:
 def _derive_provisional_group_pts(standings: list) -> dict:
     """Return {iso: 10} for teams currently in qualifying positions per API group standings.
 
-    Deduplicates by group name (most recent entry wins). Uses the API's position field
-    directly — this preserves FIFA head-to-head tiebreakers that the API has already
-    applied. When two teams share pos=2 with no pos=3 listed (a genuine tie before their
-    direct match), the lower-ranked of the two is used as the group's third-place
-    representative so the cross-group pool always has 12 teams.
-    Positions 1–2 qualify automatically; best 8 third-place teams also qualify.
+    Positions 1–2 qualify automatically (if they've played ≥ 1 game).
+    Best 8 third-place teams also qualify.
+    Applied whenever standings are available, including when some LAST_32
+    fixtures already exist (mixed group-stage / knockout state).
     """
     per_group: dict = {}
     for entry in standings:
@@ -263,7 +261,11 @@ def _derive_provisional_group_pts(standings: list) -> dict:
     for entry in per_group.values():
         by_pos: dict = {}
         for row in (entry.get("table") or []):
-            iso = WC_TEAM_MAP.get((row.get("team") or {}).get("name", ""))
+            team_name = (row.get("team") or {}).get("name", "")
+            iso = WC_TEAM_MAP.get(team_name)
+            if not iso:
+                # Try short name fallback
+                iso = WC_TEAM_MAP.get((row.get("team") or {}).get("shortName", ""))
             if not iso:
                 continue
             team = {
@@ -275,20 +277,23 @@ def _derive_provisional_group_pts(standings: list) -> dict:
             }
             by_pos.setdefault(row.get("position"), []).append(team)
 
-        # Auto-qualifiers: positions 1 and 2
+        # Auto-qualifiers: positions 1 and 2 (only once they've played ≥ 1 game)
         for pos in (1, 2):
             for team in by_pos.get(pos, []):
                 if team["played"] > 0:
                     pts[team["iso"]] = 10
 
-        # Third-place pool entry for cross-group ranking
+        # Third-place pool (only include teams that have played ≥ 1 game)
         if 3 in by_pos:
-            third_place.extend(by_pos[3])
+            for t in by_pos[3]:
+                if t["played"] > 0:
+                    third_place.append(t)
         elif len(by_pos.get(2, [])) > 1:
-            # Two teams tied at pos=2 (haven't played each other yet) — no pos=3 exists.
-            # Use the lower-ranked as this group's provisional third-place representative.
+            # Two teams tied at pos=2 before their direct match — no pos=3 exists yet.
+            # Use the lower-ranked as provisional third-place representative.
             tied = sorted(by_pos[2], key=lambda t: (-t["points"], -t["gd"], -t["gf"]))
-            third_place.append(tied[-1])
+            if tied[-1]["played"] > 0:
+                third_place.append(tied[-1])
 
     third_place.sort(key=lambda x: (-x["points"], -x["gd"], -x["gf"]))
     for t in third_place[:8]:
@@ -296,11 +301,60 @@ def _derive_provisional_group_pts(standings: list) -> dict:
     return pts
 
 
+def _derive_group_eliminations(standings: list) -> set:
+    """Return ISOs definitively eliminated from the group stage.
+
+    A team is only eliminated once its group is fully played (all 4 teams have
+    played 3 games). Position-4 teams are out; position-3 teams go into the
+    cross-group third-place pool and the bottom 4 of that pool are also out.
+    Teams whose group is still in progress are never marked eliminated here.
+    """
+    per_group: dict = {}
+    for entry in standings:
+        if entry.get("type") != "TOTAL":
+            continue
+        group = entry.get("group", "")
+        if group:
+            per_group[group] = entry
+
+    eliminated: set = set()
+    third_pool: list = []
+
+    for entry in per_group.values():
+        rows = sorted(entry.get("table") or [], key=lambda r: r.get("position", 0))
+        # Skip groups where not all teams have played 3 games yet
+        if not all(r.get("playedGames", 0) >= 3 for r in rows):
+            continue
+        for row in rows:
+            iso = WC_TEAM_MAP.get((row.get("team") or {}).get("name", "")) or \
+                  WC_TEAM_MAP.get((row.get("team") or {}).get("shortName", ""))
+            if not iso:
+                continue
+            pos = row.get("position", 0)
+            if pos == 4:
+                eliminated.add(iso)
+            elif pos == 3:
+                third_pool.append({
+                    "iso": iso,
+                    "points": row.get("points", 0),
+                    "gd": row.get("goalDifference", 0),
+                    "gf": row.get("goalsFor", 0),
+                })
+
+    # Best 8 third-place advance; the rest are out
+    third_pool.sort(key=lambda x: (-x["points"], -x["gd"], -x["gf"]))
+    for t in third_pool[8:]:
+        eliminated.add(t["iso"])
+
+    return eliminated
+
+
 def _derive_live_data(matches: list, standings: list = None) -> tuple:
     """Returns (country_points, country_status) from match results.
 
-    Group stage: provisional 10 pts for teams in qualifying positions per API standings.
-    Knockout: winner promoted, loser frozen at that stage's points and marked 'out'.
+    Group stage: provisional 10 pts for teams in qualifying positions per standings.
+    Teams are only marked 'out' when definitively eliminated (group complete + didn't
+    qualify) or when they lose a knockout match. Teams still playing are never 'out'.
     """
     pts: dict = {}
     stat: dict = {}
@@ -345,16 +399,15 @@ def _derive_live_data(matches: list, standings: list = None) -> tuple:
                 pts[l_iso] = max(pts.get(l_iso, 0), _STAGE_PTS[stage])
                 stat[l_iso] = "out"
 
-    # Group stage: award provisional pts from standings when no LAST_32 fixtures exist yet
-    if not in_knockout and standings:
+    # Provisional standings — always apply (even when some LAST_32 fixtures exist).
+    prov_quals: set = set()
+    if standings:
         for iso, p in _derive_provisional_group_pts(standings).items():
+            prov_quals.add(iso)
             pts[iso] = max(pts.get(iso, 0), p)
-
-    # Once LAST_32 fixtures exist the group stage is done — remaining picks are eliminated
-    if in_knockout:
-        all_picks = {iso for d in PEOPLE.values() for _, iso, _, _ in d["countries"]}
-        for iso in all_picks:
-            if iso not in in_knockout and iso not in stat:
+        # Mark only teams whose group is fully played and who definitively didn't qualify.
+        for iso in _derive_group_eliminations(standings):
+            if iso not in stat:
                 stat[iso] = "out"
 
     return pts, stat
@@ -405,7 +458,16 @@ COUNTRY_POINTS, COUNTRY_STATUS = _derive_live_data(_matches_data, _standings_dat
 for _iso, _bonus in _derive_golden_boot(_scorers_data).items():
     COUNTRY_POINTS[_iso] = COUNTRY_POINTS.get(_iso, 0) + _bonus
 _live_ok = bool(_api_key and _matches_data)
-_in_group_stage = _live_ok and not any(m.get("stage") == "LAST_32" for m in _matches_data)
+# Count confirmed R32 slots. We stay in "group stage" mode (showing PROV labels)
+# until all 32 slots are filled — not just when the first R32 match gets scheduled.
+_confirmed_r32_isos: set = set()
+for _m in _matches_data:
+    if _m.get("stage") == "LAST_32":
+        for _side in ("homeTeam", "awayTeam"):
+            _iso = WC_TEAM_MAP.get((_m.get(_side) or {}).get("name", ""))
+            if _iso:
+                _confirmed_r32_isos.add(_iso)
+_in_group_stage = _live_ok and len(_confirmed_r32_isos) < 32
 
 iso_index: dict = {}
 for person, data in PEOPLE.items():
