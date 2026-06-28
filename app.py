@@ -450,23 +450,30 @@ def _build_bracket_html(matches: list) -> str:
             iso_to_name[iso] = name
             iso_to_fc[iso] = fc
 
+    _SHORT = {
+        "BIH": "Bosnia", "USA": "USA", "ZAF": "S. Africa",
+        "KOR": "S. Korea", "SAU": "S. Arabia", "NZL": "N. Zealand",
+        "CIV": "Ivory Coast", "COD": "Congo DR", "CPV": "Cape Verde",
+        "SCT": "Scotland",
+    }
+
     def _isos(m):
-        if not m:
-            return None, None
+        if not m: return None, None
         h = WC_TEAM_MAP.get((m.get("homeTeam") or {}).get("name", ""))
         a = WC_TEAM_MAP.get((m.get("awayTeam") or {}).get("name", ""))
         return h, a
 
-    def _winner(m):
-        if not m or m.get("status") != "FINISHED":
-            return None
+    def _winner_derived(m, h_ov=None, a_ov=None):
+        """Winner ISO of a match; team names from API or overridden by derived ISOs."""
+        if not m or m.get("status") != "FINISHED": return None
         w = (m.get("score") or {}).get("winner")
         h, a = _isos(m)
+        if not h: h = h_ov
+        if not a: a = a_ov
         return h if w == "HOME_TEAM" else (a if w == "AWAY_TEAM" else None)
 
     def _score_str(m):
-        if not m:
-            return ""
+        if not m: return ""
         ft = ((m.get("score") or {}).get("fullTime") or {})
         h, a = ft.get("home"), ft.get("away")
         return f"{h}–{a}" if h is not None and a is not None else ""
@@ -477,7 +484,7 @@ def _build_bracket_html(matches: list) -> str:
                     "display:flex;align-items:center;padding:0 8px;"
                     "font-size:11px;color:#4b5563;font-weight:600;'>TBD</div>")
         color = iso_to_color.get(iso, "#4b5563")
-        name = iso_to_name.get(iso, iso)
+        name = _SHORT.get(iso, iso_to_name.get(iso, iso))
         fc = iso_to_fc.get(iso, "")
         flag = (f"<img src='https://flagcdn.com/w20/{fc}.png' "
                 f"style='height:12px;border-radius:1px;margin-right:5px;"
@@ -494,9 +501,12 @@ def _build_bracket_html(matches: list) -> str:
                 f"white-space:nowrap;box-shadow:0 1px 4px rgba(0,0,0,0.4);'>"
                 f"{flag}{name}</div>")
 
-    def _matchup(m):
+    def _matchup(m, h_ov=None, a_ov=None):
+        """Render a matchup. h_ov/a_ov are derived team ISOs used when the API slot is empty."""
         h, a = _isos(m)
-        w = _winner(m)
+        if not h: h = h_ov
+        if not a: a = a_ov
+        w = _winner_derived(m, h_ov, a_ov)
         sc = _score_str(m)
         score_html = (f"<div style='height:10px;text-align:center;font-size:9px;"
                       f"color:#6b7280;font-weight:700;line-height:10px;'>{sc}</div>")
@@ -509,13 +519,14 @@ def _build_bracket_html(matches: list) -> str:
 
     INNER_H = 560
 
-    def _col(match_list, label):
-        items = "".join(f"<div>{_matchup(m)}</div>" for m in match_list)
+    def _col(slots, label):
+        """slots: list of (match, h_ov, a_ov)"""
+        items = "".join(f"<div>{_matchup(m, h, a)}</div>" for m, h, a in slots)
         return (
             f"<div style='flex:1;min-width:90px;display:flex;flex-direction:column;'>"
             f"<div style='font-size:9px;font-weight:800;color:#6b7280;"
             f"text-align:center;letter-spacing:1px;text-transform:uppercase;"
-            f"padding-bottom:7px;border-bottom:1px solid #1f2937;margin-bottom:0;'>{label}</div>"
+            f"padding-bottom:7px;border-bottom:1px solid #1f2937;'>{label}</div>"
             f"<div style='display:flex;flex-direction:column;"
             f"justify-content:space-around;height:{INNER_H}px;'>{items}</div>"
             f"</div>"
@@ -527,6 +538,9 @@ def _build_bracket_html(matches: list) -> str:
     def _by_stage(stage):
         return sorted([m for m in matches if m.get("stage") == stage],
                       key=lambda m: m.get("id", 0))
+
+    def _g(lst, i):
+        return lst[i] if i < len(lst) else None
 
     r32 = _by_stage("LAST_32")
     r16 = _by_stage("LAST_16")
@@ -543,15 +557,49 @@ def _build_bracket_html(matches: list) -> str:
     r_r16 = _pad(r16[4:8], 4)
     r_r32 = _pad(r32[8:16], 8)
 
-    fin_m = fin[0] if fin else None
-    champ = _winner(fin_m)
+    # ── Derive teams for each round from the previous round's winners ─────────
+    # If the API hasn't populated a fixture's team names yet, we fill them from
+    # the winner of the feeding match. Pairing: R32[2i]/R32[2i+1] → R16[i], etc.
+
+    def _make_slots(current, sources):
+        """Build (match, h_ov, a_ov) slots. sources[i] = (match, h_ov, a_ov) for the
+        two matches that feed slot i (home = winner of sources[2i], away = sources[2i+1])."""
+        slots = []
+        for i, m in enumerate(current):
+            src_h = _g(sources, 2 * i)
+            src_a = _g(sources, 2 * i + 1)
+            h_ov = _winner_derived(*(src_h or (None, None, None)))
+            a_ov = _winner_derived(*(src_a or (None, None, None)))
+            slots.append((m, h_ov, a_ov))
+        return slots
+
+    l_r32_slots = [(m, None, None) for m in l_r32]
+    l_r16_slots = _make_slots(l_r16, l_r32_slots)
+    l_qf_slots  = _make_slots(l_qf,  l_r16_slots)
+    l_sf_slots  = _make_slots(l_sf,  l_qf_slots)
+
+    r_r32_slots = [(m, None, None) for m in r_r32]
+    r_r16_slots = _make_slots(r_r16, r_r32_slots)
+    r_qf_slots  = _make_slots(r_qf,  r_r16_slots)
+    r_sf_slots  = _make_slots(r_sf,  r_qf_slots)
+
+    # Final teams derive from the two SF winners
+    l_sf_win = _winner_derived(*(_g(l_sf_slots, 0) or (None, None, None)))
+    r_sf_win = _winner_derived(*(_g(r_sf_slots, 0) or (None, None, None)))
+    fin_m = _g(fin, 0)
+    fin_h, fin_a = _isos(fin_m)
+    if not fin_h: fin_h = l_sf_win
+    if not fin_a: fin_a = r_sf_win
+
+    # ── Champion ──────────────────────────────────────────────────────────────
+    champ = _winner_derived(fin_m, l_sf_win, r_sf_win)
     champ_html = ""
     if champ:
         c = iso_to_color.get(champ, "#6b7280")
         n = iso_to_name.get(champ, champ)
-        fc = iso_to_fc.get(champ, "")
-        fg = (f"<img src='https://flagcdn.com/w20/{fc}.png' "
-              f"style='height:14px;border-radius:1px;margin-right:5px;'>") if fc else ""
+        fc_c = iso_to_fc.get(champ, "")
+        fg = (f"<img src='https://flagcdn.com/w20/{fc_c}.png' "
+              f"style='height:14px;border-radius:1px;margin-right:5px;'>") if fc_c else ""
         champ_html = (f"<div style='margin-top:10px;background:{c};color:white;"
                       f"border-radius:6px;padding:8px 10px;font-size:12px;"
                       f"font-weight:800;display:flex;align-items:center;"
@@ -563,7 +611,7 @@ def _build_bracket_html(matches: list) -> str:
         f"align-items:center;justify-content:center;height:{INNER_H + 20}px;padding:0 6px;'>"
         f"<div style='font-size:9px;font-weight:800;color:#6b7280;"
         f"letter-spacing:1px;text-transform:uppercase;padding-bottom:7px;'>Final</div>"
-        f"<div style='width:100%;'>{_matchup(fin_m)}</div>"
+        f"<div style='width:100%;'>{_matchup(fin_m, l_sf_win, r_sf_win)}</div>"
         f"{champ_html}"
         f"</div>"
     )
@@ -588,15 +636,15 @@ def _build_bracket_html(matches: list) -> str:
         f"<div style='display:flex;align-items:center;flex-wrap:wrap;'>{legend_items}</div>"
         f"</div>"
         f"<div style='display:flex;align-items:flex-start;gap:0;width:100%;'>"
-        f"{_col(l_r32, 'Round of 32')}{gap}"
-        f"{_col(l_r16, 'Round of 16')}{gap}"
-        f"{_col(l_qf, 'Quarter-Final')}{gap}"
-        f"{_col(l_sf, 'Semi-Final')}{gap}"
+        f"{_col(l_r32_slots, 'Round of 32')}{gap}"
+        f"{_col(l_r16_slots, 'Round of 16')}{gap}"
+        f"{_col(l_qf_slots, 'Quarter-Final')}{gap}"
+        f"{_col(l_sf_slots, 'Semi-Final')}{gap}"
         f"{center}{gap}"
-        f"{_col(r_sf, 'Semi-Final')}{gap}"
-        f"{_col(r_qf, 'Quarter-Final')}{gap}"
-        f"{_col(r_r16, 'Round of 16')}{gap}"
-        f"{_col(r_r32, 'Round of 32')}"
+        f"{_col(r_sf_slots, 'Semi-Final')}{gap}"
+        f"{_col(r_qf_slots, 'Quarter-Final')}{gap}"
+        f"{_col(r_r16_slots, 'Round of 16')}{gap}"
+        f"{_col(r_r32_slots, 'Round of 32')}"
         f"</div></div>"
     )
 
