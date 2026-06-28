@@ -436,9 +436,169 @@ for _m in _matches_data:
             if _iso:
                 _confirmed_r32_isos.add(_iso)
 _in_group_stage = _live_ok and len(_confirmed_r32_isos) < 32
+_has_knockout = any(m.get("stage") == "LAST_32" for m in _matches_data)
 
 def person_total(person: str) -> int:
     return sum(COUNTRY_POINTS.get(iso, 0) for _, iso, _, _ in PEOPLE[person]["countries"])
+
+
+def _build_bracket_html(matches: list) -> str:
+    iso_to_color, iso_to_name, iso_to_fc = {}, {}, {}
+    for pdata in PEOPLE.values():
+        for name, iso, _, fc in pdata["countries"]:
+            iso_to_color[iso] = pdata["color"]
+            iso_to_name[iso] = name
+            iso_to_fc[iso] = fc
+
+    def _isos(m):
+        if not m:
+            return None, None
+        h = WC_TEAM_MAP.get((m.get("homeTeam") or {}).get("name", ""))
+        a = WC_TEAM_MAP.get((m.get("awayTeam") or {}).get("name", ""))
+        return h, a
+
+    def _winner(m):
+        if not m or m.get("status") != "FINISHED":
+            return None
+        w = (m.get("score") or {}).get("winner")
+        h, a = _isos(m)
+        return h if w == "HOME_TEAM" else (a if w == "AWAY_TEAM" else None)
+
+    def _score_str(m):
+        if not m:
+            return ""
+        ft = ((m.get("score") or {}).get("fullTime") or {})
+        h, a = ft.get("home"), ft.get("away")
+        return f"{h}–{a}" if h is not None and a is not None else ""
+
+    def _slot(iso, loser=False):
+        if not iso:
+            return ("<div style='height:30px;background:#1f2937;border-radius:4px;"
+                    "display:flex;align-items:center;padding:0 8px;"
+                    "font-size:11px;color:#4b5563;font-weight:600;'>TBD</div>")
+        color = iso_to_color.get(iso, "#4b5563")
+        name = iso_to_name.get(iso, iso)
+        fc = iso_to_fc.get(iso, "")
+        flag = (f"<img src='https://flagcdn.com/w20/{fc}.png' "
+                f"style='height:12px;border-radius:1px;margin-right:5px;"
+                f"flex-shrink:0;vertical-align:middle;'>") if fc else ""
+        if loser:
+            return (f"<div style='height:30px;background:#1a2332;border-radius:4px;"
+                    f"display:flex;align-items:center;padding:0 8px;"
+                    f"font-size:11px;color:#374151;font-weight:600;"
+                    f"overflow:hidden;white-space:nowrap;border-left:3px solid #374151;'>"
+                    f"{flag}<span style='text-decoration:line-through;opacity:0.45;'>{name}</span></div>")
+        return (f"<div style='height:30px;background:{color};border-radius:4px;"
+                f"display:flex;align-items:center;padding:0 8px;"
+                f"font-size:11px;color:white;font-weight:700;overflow:hidden;"
+                f"white-space:nowrap;box-shadow:0 1px 4px rgba(0,0,0,0.4);'>"
+                f"{flag}{name}</div>")
+
+    def _matchup(m):
+        h, a = _isos(m)
+        w = _winner(m)
+        sc = _score_str(m)
+        score_html = (f"<div style='height:10px;text-align:center;font-size:9px;"
+                      f"color:#6b7280;font-weight:700;line-height:10px;'>{sc}</div>")
+        return (f"<div style='display:flex;flex-direction:column;gap:0;"
+                f"background:#0f172a;border-radius:5px;padding:3px;'>"
+                f"{_slot(h, bool(w and w != h))}"
+                f"{score_html}"
+                f"{_slot(a, bool(w and w != a))}"
+                f"</div>")
+
+    INNER_H = 560
+
+    def _col(match_list, label):
+        items = "".join(f"<div>{_matchup(m)}</div>" for m in match_list)
+        return (
+            f"<div style='flex:1;min-width:90px;display:flex;flex-direction:column;'>"
+            f"<div style='font-size:9px;font-weight:800;color:#6b7280;"
+            f"text-align:center;letter-spacing:1px;text-transform:uppercase;"
+            f"padding-bottom:7px;border-bottom:1px solid #1f2937;margin-bottom:0;'>{label}</div>"
+            f"<div style='display:flex;flex-direction:column;"
+            f"justify-content:space-around;height:{INNER_H}px;'>{items}</div>"
+            f"</div>"
+        )
+
+    def _pad(lst, n):
+        return list(lst) + [None] * max(0, n - len(lst))
+
+    def _by_stage(stage):
+        return sorted([m for m in matches if m.get("stage") == stage],
+                      key=lambda m: m.get("id", 0))
+
+    r32 = _by_stage("LAST_32")
+    r16 = _by_stage("LAST_16")
+    qf  = _by_stage("QUARTER_FINALS")
+    sf  = _by_stage("SEMI_FINALS")
+    fin = _by_stage("FINAL")
+
+    l_r32 = _pad(r32[:8], 8)
+    l_r16 = _pad(r16[:4], 4)
+    l_qf  = _pad(qf[:2], 2)
+    l_sf  = _pad(sf[:1], 1)
+    r_sf  = _pad(sf[1:2], 1)
+    r_qf  = _pad(qf[2:4], 2)
+    r_r16 = _pad(r16[4:8], 4)
+    r_r32 = _pad(r32[8:16], 8)
+
+    fin_m = fin[0] if fin else None
+    champ = _winner(fin_m)
+    champ_html = ""
+    if champ:
+        c = iso_to_color.get(champ, "#6b7280")
+        n = iso_to_name.get(champ, champ)
+        fc = iso_to_fc.get(champ, "")
+        fg = (f"<img src='https://flagcdn.com/w20/{fc}.png' "
+              f"style='height:14px;border-radius:1px;margin-right:5px;'>") if fc else ""
+        champ_html = (f"<div style='margin-top:10px;background:{c};color:white;"
+                      f"border-radius:6px;padding:8px 10px;font-size:12px;"
+                      f"font-weight:800;display:flex;align-items:center;"
+                      f"justify-content:center;box-shadow:0 2px 12px rgba(0,0,0,0.5);'>"
+                      f"🏆 &nbsp;{fg}{n}</div>")
+
+    center = (
+        f"<div style='flex:1.1;min-width:110px;display:flex;flex-direction:column;"
+        f"align-items:center;justify-content:center;height:{INNER_H + 20}px;padding:0 6px;'>"
+        f"<div style='font-size:9px;font-weight:800;color:#6b7280;"
+        f"letter-spacing:1px;text-transform:uppercase;padding-bottom:7px;'>Final</div>"
+        f"<div style='width:100%;'>{_matchup(fin_m)}</div>"
+        f"{champ_html}"
+        f"</div>"
+    )
+
+    gap = "<div style='width:6px;flex-shrink:0;'></div>"
+
+    legend_items = "".join(
+        f"<span style='display:inline-flex;align-items:center;gap:5px;margin-right:14px;'>"
+        f"<span style='width:12px;height:12px;border-radius:3px;background:{d['color']};"
+        f"display:inline-block;box-shadow:0 1px 3px rgba(0,0,0,0.3);'></span>"
+        f"<span style='font-size:11px;color:#9ca3af;font-weight:700;'>{p}</span></span>"
+        for p, d in PEOPLE.items()
+    )
+
+    return (
+        f"<div style='background:#0d1117;border-radius:16px;padding:22px 18px 20px;"
+        f"margin-top:16px;border:1px solid #1f2937;'>"
+        f"<div style='display:flex;align-items:center;justify-content:space-between;"
+        f"margin-bottom:16px;flex-wrap:wrap;gap:8px;'>"
+        f"<div style='font-size:15px;font-weight:800;color:#f0c040;letter-spacing:2px;'>"
+        f"⚽ &nbsp;KNOCKOUT BRACKET</div>"
+        f"<div style='display:flex;align-items:center;flex-wrap:wrap;'>{legend_items}</div>"
+        f"</div>"
+        f"<div style='display:flex;align-items:flex-start;gap:0;width:100%;'>"
+        f"{_col(l_r32, 'Round of 32')}{gap}"
+        f"{_col(l_r16, 'Round of 16')}{gap}"
+        f"{_col(l_qf, 'Quarter-Final')}{gap}"
+        f"{_col(l_sf, 'Semi-Final')}{gap}"
+        f"{center}{gap}"
+        f"{_col(r_sf, 'Semi-Final')}{gap}"
+        f"{_col(r_qf, 'Quarter-Final')}{gap}"
+        f"{_col(r_r16, 'Round of 16')}{gap}"
+        f"{_col(r_r32, 'Round of 32')}"
+        f"</div></div>"
+    )
 
 
 # ── Session state init ────────────────────────────────────────────────────────
@@ -563,6 +723,10 @@ if st.session_state.show_countries:
                 unsafe_allow_html=True,
             )
 
+
+# ── Knockout Bracket ─────────────────────────────────────────────────────────
+if _live_ok and _has_knockout:
+    st.markdown(_build_bracket_html(_matches_data), unsafe_allow_html=True)
 
 # ── Refresh + live data controls ──────────────────────────────────────────────
 if _live_ok:
