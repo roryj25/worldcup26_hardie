@@ -1,16 +1,7 @@
-﻿import base64
-import datetime
+﻿import datetime
 import requests
 
-import plotly.graph_objects as go
 import streamlit as st
-
-# 1×1 white pixel as SVG data-URI — used as a layout image so it sits *below*
-# flag images in the z-stack (add_shape renders above layout images in Plotly).
-_WHITE_RECT = "data:image/svg+xml;base64," + base64.b64encode(
-    b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1">'
-    b'<rect fill="white" width="1" height="1"/></svg>'
-).decode()
 
 st.set_page_config(
     page_title="World Cup 2026 · The Hardie Family Showdown",
@@ -94,25 +85,6 @@ PEOPLE = {
 COUNTRY_POINTS: dict = {}
 COUNTRY_STATUS: dict = {}
 
-CAPITALS: dict = {
-    "PRT": "Lisbon",        "DEU": "Berlin",        "MAR": "Rabat",
-    "CHE": "Bern",          "SEN": "Dakar",          "KOR": "Seoul",
-    "GHA": "Accra",         "BIH": "Sarajevo",       "ZAF": "Pretoria",
-    "QAT": "Doha",          "JOR": "Amman",           "HTI": "Port-au-Prince",
-    "FRA": "Paris",         "BRA": "Brasília",        "URY": "Montevideo",
-    "NOR": "Oslo",          "MEX": "Mexico City",     "JPN": "Tokyo",
-    "EGY": "Cairo",         "CZE": "Prague",          "PAN": "Panama City",
-    "IRQ": "Baghdad",       "CUW": "Willemstad",      "NZL": "Wellington",
-    "ESP": "Madrid",        "NLD": "Amsterdam",       "BEL": "Brussels",
-    "AUT": "Vienna",        "TUR": "Ankara",          "CIV": "Yamoussoukro",
-    "ECU": "Quito",         "SCT": "Edinburgh",       "CAN": "Ottawa",
-    "UZB": "Tashkent",      "SAU": "Riyadh",          "CPV": "Praia",
-    "ARG": "Buenos Aires",  "ENG": "London",          "HRV": "Zagreb",
-    "COL": "Bogotá",        "USA": "Washington D.C.", "SWE": "Stockholm",
-    "IRN": "Tehran",        "DZA": "Algiers",         "TUN": "Tunis",
-    "PRY": "Asunción",      "AUS": "Canberra",        "COD": "Kinshasa",
-}
-
 SCORING = [
     ("⚽", "Round of 32",    10),
     ("🎯", "Round of 16",    20),
@@ -123,11 +95,7 @@ SCORING = [
     ("👟", "Golden Boot",     25),
 ]
 
-# ISO codes not in Plotly's built-in world shapes → nearest displayable equivalent
-MAP_ISO: dict = {
-    "ENG": "GBR",  # England shown as United Kingdom
-    "SCT": "GBR",  # Scotland shown as United Kingdom
-}
+
 
 # ── Live data from football-data.org ─────────────────────────────────────────
 # Free tier · 10 req/min · comp code WC · register at football-data.org/client/register
@@ -469,258 +437,13 @@ for _m in _matches_data:
                 _confirmed_r32_isos.add(_iso)
 _in_group_stage = _live_ok and len(_confirmed_r32_isos) < 32
 
-iso_index: dict = {}
-for person, data in PEOPLE.items():
-    for name, iso, flag, flag_code in data["countries"]:
-        entry = {"person": person, "country": name, "iso": iso,
-                 "flag": flag, "flag_code": flag_code, "color": data["color"]}
-        iso_index.setdefault(iso, []).append(entry)
-        # Also register under the display ISO so click events on GBR etc. resolve correctly
-        if iso in MAP_ISO:
-            iso_index.setdefault(MAP_ISO[iso], []).append(entry)
-
-PERSON_ORDER = list(PEOPLE.keys())
-
-
 def person_total(person: str) -> int:
     return sum(COUNTRY_POINTS.get(iso, 0) for _, iso, _, _ in PEOPLE[person]["countries"])
-
-
-# ── Map ───────────────────────────────────────────────────────────────────────
-# Uses Plotly's built-in ISO-3 world shapes — no GeoJSON file, renders instantly.
-# Only WC countries are coloured; the rest show as landcolor.
-def make_map(selected_iso=None):
-    tc = [data["color"] for data in PEOPLE.values()]
-
-    team_lookup = {}
-    plot_rows = {}  # plot_iso → (z, hover_text); later teams overwrite earlier ones
-    for person_idx, (person, data) in enumerate(PEOPLE.items(), start=1):
-        for name, iso, flag, flag_code in data["countries"]:
-            team_lookup[iso] = {
-                "person": person, "z": person_idx,
-                "name": name, "flag": flag, "flag_code": flag_code,
-            }
-            plot_iso = MAP_ISO.get(iso, iso)
-            plot_rows[plot_iso] = (person_idx, f"<b>{name}</b><br>{person}")
-
-    # For plot ISOs shared by multiple teams (e.g. GBR = England + Scotland),
-    # update the hover to credit all teams and add a merged team_lookup entry.
-    for plot_iso, picks in iso_index.items():
-        if plot_iso in plot_rows and len(picks) > 1:
-            nations = "<br>".join(
-                f"{p['flag']} {p['country']} → {p['person']}" for p in picks
-            )
-            plot_rows[plot_iso] = (
-                plot_rows[plot_iso][0],
-                f"<b>United Kingdom</b><br>{nations}",
-            )
-            team_lookup[plot_iso] = {
-                "person": " & ".join(p["person"] for p in picks),
-                "z": plot_rows[plot_iso][0],
-                "name": " & ".join(p["country"] for p in picks),
-                "flag": " ".join(p["flag"] for p in picks),
-                "flag_code": picks[-1]["flag_code"],
-            }
-
-    locs = list(plot_rows.keys())
-    z_vals = [v[0] for v in plot_rows.values()]
-    hover = [v[1] for v in plot_rows.values()]
-
-    # Discrete 4-band colorscale  z=1→Rory  z=2→Dad  z=3→Mum  z=4→Alex
-    colorscale = [
-        [0.000, tc[0]], [0.249, tc[0]],
-        [0.250, tc[1]], [0.499, tc[1]],
-        [0.500, tc[2]], [0.749, tc[2]],
-        [0.750, tc[3]], [1.000, tc[3]],
-    ]
-
-    fig = go.Figure(go.Choropleth(
-        locations=locs,
-        locationmode="ISO-3",
-        z=z_vals,
-        zmin=1,
-        zmax=4,
-        colorscale=colorscale,
-        showscale=False,
-        text=hover,
-        hovertemplate="%{text}<extra></extra>",
-        marker_line_color="rgba(255,255,255,0.6)",
-        marker_line_width=0.7,
-        # Lock opacity so Plotly's selection mode never dims the map
-        selected=dict(marker=dict(opacity=1.0)),
-        unselected=dict(marker=dict(opacity=1.0)),
-    ))
-
-    # ── Selected country: bold border + bottom info card overlay ──────────────
-    if selected_iso and selected_iso in team_lookup:
-        t = team_lookup[selected_iso]
-        team_color = PEOPLE[t["person"].split(" & ")[0]]["color"]
-        fig.add_trace(go.Choropleth(
-            locations=[selected_iso],
-            locationmode="ISO-3",
-            z=[1],
-            zmin=0, zmax=1,
-            colorscale=[[0, team_color], [1, team_color]],
-            showscale=False,
-            marker_line_color="#1a1a1a",
-            marker_line_width=1.5,
-            hoverinfo="skip",
-            selected=dict(marker=dict(opacity=1.0)),
-            unselected=dict(marker=dict(opacity=1.0)),
-        ))
-
-        # Info card at the bottom of the map
-        picks = iso_index.get(selected_iso, [])
-        n = len(picks)
-        row_h = 0.09
-        card_y1, card_y0 = 0.995, 0.995 - row_h * n
-
-        # Card background — layout image so it sits BELOW flag images in z-order
-        # (add_shape renders above layout images; using a white SVG image fixes
-        # the "faded flag" issue where the shape was covering the flag at 97% opacity)
-        fig.add_layout_image(
-            source=_WHITE_RECT,
-            x=0.01, y=card_y1,
-            xref="paper", yref="paper",
-            xanchor="left", yanchor="top",
-            sizex=0.98, sizey=card_y1 - card_y0,
-            sizing="stretch",
-            opacity=1.0,
-            layer="above",
-        )
-        # Thin border around the card (transparent fill — won't cover flags)
-        fig.add_shape(
-            type="rect",
-            x0=0.01, y0=card_y0, x1=0.99, y1=card_y1,
-            xref="paper", yref="paper",
-            fillcolor="rgba(0,0,0,0)",
-            line=dict(color="#d1d5db", width=1),
-            layer="above",
-        )
-
-        for i, p in enumerate(picks):
-            cp = COUNTRY_POINTS.get(p["iso"], 0)
-            color = p["color"]
-            status = COUNTRY_STATUS.get(p["iso"], "in").upper()
-            status_color = "#16a34a" if status == "IN" else "#dc2626"
-            row_mid = card_y1 - (i + 0.5) * row_h
-            bh = row_h * 0.50          # badge half-height
-            by0, by1 = row_mid - bh / 2, row_mid + bh / 2
-
-            # Row divider for multi-pick
-            if i > 0:
-                fig.add_shape(
-                    type="line",
-                    x0=0.02, y0=card_y1 - i * row_h,
-                    x1=0.98, y1=card_y1 - i * row_h,
-                    xref="paper", yref="paper",
-                    line=dict(color="#e5e7eb", width=0.5),
-                    layer="above",
-                )
-
-            # Flag image (full opacity, contained aspect ratio)
-            fig.add_layout_image(
-                source=f"https://flagcdn.com/w40/{p['flag_code']}.png",
-                x=0.04, y=row_mid,
-                xref="paper", yref="paper",
-                xanchor="center", yanchor="middle",
-                sizex=0.048, sizey=row_h * 0.60,
-                opacity=1.0,
-                sizing="contain",
-                layer="above",
-            )
-
-            # Country name + capital
-            capital = CAPITALS.get(p["iso"], "")
-            cap_str = f" ({capital})" if capital else ""
-            fig.add_annotation(
-                x=0.085, y=row_mid,
-                xref="paper", yref="paper",
-                text=f"<b>{p['country']}</b>{cap_str}",
-                showarrow=False,
-                font=dict(size=14, color="#111827", family="Arial"),
-                xanchor="left", yanchor="middle",
-                bgcolor=None, borderwidth=0,
-            )
-
-            # Person badge — coloured box with white text
-            fig.add_shape(
-                type="rect",
-                x0=0.60, y0=by0, x1=0.76, y1=by1,
-                xref="paper", yref="paper",
-                fillcolor=color, line=dict(width=0),
-                layer="above",
-            )
-            fig.add_annotation(
-                x=0.68, y=row_mid,
-                xref="paper", yref="paper",
-                text=f"<b>{p['person']}</b>",
-                showarrow=False,
-                font=dict(size=11, color="white", family="Arial"),
-                xanchor="center", yanchor="middle",
-                bgcolor=None, borderwidth=0,
-            )
-
-            # IN / OUT badge
-            fig.add_shape(
-                type="rect",
-                x0=0.78, y0=by0, x1=0.86, y1=by1,
-                xref="paper", yref="paper",
-                fillcolor=status_color, line=dict(width=0),
-                layer="above",
-            )
-            fig.add_annotation(
-                x=0.82, y=row_mid,
-                xref="paper", yref="paper",
-                text=f"<b>{status}</b>",
-                showarrow=False,
-                font=dict(size=10, color="white", family="Arial"),
-                xanchor="center", yanchor="middle",
-                bgcolor=None, borderwidth=0,
-            )
-
-            # Points
-            fig.add_annotation(
-                x=0.89, y=row_mid,
-                xref="paper", yref="paper",
-                text=f"<b>{cp} pts</b>",
-                showarrow=False,
-                font=dict(size=14, color=color, family="Arial"),
-                xanchor="left", yanchor="middle",
-                bgcolor=None, borderwidth=0,
-            )
-
-    fig.update_layout(
-        showlegend=False,
-        margin=dict(l=0, r=0, t=0, b=0),
-        height=560,
-        transition={"duration": 0},
-        geo=dict(
-            showframe=False,
-            showcoastlines=True,
-            coastlinecolor="#b0bec5",
-            showocean=True,
-            oceancolor="#d6eaf8",
-            landcolor="#eceff1",
-            showcountries=True,
-            countrycolor="#c5cdd6",
-            countrywidth=0.4,
-            projection_type="equirectangular",
-            bgcolor="#d6eaf8",
-            lataxis=dict(range=[-90, 90], showgrid=False),
-            lonaxis=dict(range=[-180, 180], showgrid=False),
-        ),
-        paper_bgcolor="#d6eaf8",
-        hoverlabel=dict(bgcolor="white", font_size=13),
-        uirevision="stable",
-    )
-    return fig
 
 
 # ── Session state init ────────────────────────────────────────────────────────
 if "initialized" not in st.session_state:
     st.session_state.initialized = True
-    st.session_state.selected_iso = None
     st.session_state.show_countries = False
 
 # ── Page ──────────────────────────────────────────────────────────────────────
@@ -840,25 +563,6 @@ if st.session_state.show_countries:
                 unsafe_allow_html=True,
             )
 
-st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-
-# ── Map ───────────────────────────────────────────────────────────────────────
-# Pre-read the chart's pending selection from session_state so selected_iso is
-# up-to-date before make_map() is called — avoids a second rerun per click.
-_cs = st.session_state.get("map")
-if _cs is not None and hasattr(_cs, "selection") and _cs.selection.points:
-    _clicked = _cs.selection.points[0].get("location")
-    if _clicked and _clicked in iso_index:
-        st.session_state.selected_iso = _clicked
-
-st.plotly_chart(
-    make_map(selected_iso=st.session_state.selected_iso),
-    use_container_width=True,
-    on_select="rerun",
-    key="map",
-    theme=None,
-    config={"scrollZoom": True, "displayModeBar": True, "displaylogo": False},
-)
 
 # ── Refresh + live data controls ──────────────────────────────────────────────
 if _live_ok:
