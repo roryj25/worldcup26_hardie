@@ -542,51 +542,83 @@ def _build_bracket_html(matches: list) -> str:
     def _g(lst, i):
         return lst[i] if i < len(lst) else None
 
+    def _mkey(m):
+        h, a = _isos(m)
+        return frozenset([h, a]) if h and a else None
+
+    def _find_match(pool, h_iso, a_iso):
+        """Return the fixture in pool whose two teams match h_iso/a_iso (either order)."""
+        if not h_iso or not a_iso:
+            return None
+        want = frozenset([h_iso, a_iso])
+        for m in pool:
+            if _mkey(m) == want:
+                return m
+        return None
+
     r32 = _by_stage("LAST_32")
     r16 = _by_stage("LAST_16")
     qf  = _by_stage("QUARTER_FINALS")
     sf  = _by_stage("SEMI_FINALS")
     fin = _by_stage("FINAL")
 
-    l_r32 = _pad(r32[:8], 8)
-    l_r16 = _pad(r16[:4], 4)
-    l_qf  = _pad(qf[:2], 2)
-    l_sf  = _pad(sf[:1], 1)
-    r_sf  = _pad(sf[1:2], 1)
-    r_qf  = _pad(qf[2:4], 2)
-    r_r16 = _pad(r16[4:8], 4)
-    r_r32 = _pad(r32[8:16], 8)
+    # ── Sort R32 into correct bracket positions using the draw ────────────────
+    # Sorting by API match ID is unreliable because the schedule interleaves
+    # left/right bracket games. We hardcode the known bracket draw order.
+    _L_ORDER = [
+        frozenset(["DEU","PRY"]), frozenset(["FRA","SWE"]),
+        frozenset(["ZAF","CAN"]), frozenset(["NLD","MAR"]),
+        frozenset(["PRT","HRV"]), frozenset(["ESP","AUT"]),
+        frozenset(["USA","BIH"]), frozenset(["BEL","SEN"]),
+    ]
+    _R_ORDER = [
+        frozenset(["BRA","JPN"]), frozenset(["CIV","NOR"]),
+        frozenset(["MEX","ECU"]), frozenset(["ENG","COD"]),
+        frozenset(["ARG","CPV"]), frozenset(["AUS","EGY"]),
+        frozenset(["CHE","DZA"]), frozenset(["COL","GHA"]),
+    ]
+    _l_idx = {k: i for i, k in enumerate(_L_ORDER)}
+    _r_idx = {k: i for i, k in enumerate(_R_ORDER)}
 
-    # ── Derive teams for each round from the previous round's winners ─────────
-    # If the API hasn't populated a fixture's team names yet, we fill them from
-    # the winner of the feeding match. Pairing: R32[2i]/R32[2i+1] → R16[i], etc.
+    l_r32 = _pad(
+        sorted([m for m in r32 if _mkey(m) in _l_idx], key=lambda m: _l_idx.get(_mkey(m), 99)),
+        8,
+    )
+    r_r32 = _pad(
+        sorted([m for m in r32 if _mkey(m) in _r_idx], key=lambda m: _r_idx.get(_mkey(m), 99)),
+        8,
+    )
 
-    def _make_slots(current, sources):
-        """Build (match, h_ov, a_ov) slots. sources[i] = (match, h_ov, a_ov) for the
-        two matches that feed slot i (home = winner of sources[2i], away = sources[2i+1])."""
-        slots = []
-        for i, m in enumerate(current):
-            src_h = _g(sources, 2 * i)
-            src_a = _g(sources, 2 * i + 1)
-            h_ov = _winner_derived(*(src_h or (None, None, None)))
-            a_ov = _winner_derived(*(src_a or (None, None, None)))
-            slots.append((m, h_ov, a_ov))
-        return slots
+    # ── Build each subsequent round by deriving teams from previous winners ───
+    # For each next-round slot i: home = winner of source[2i], away = winner of source[2i+1].
+    # The API fixture is located by team-name matching (not ID order) so a mis-ordered
+    # schedule can never put the wrong team in the wrong bracket column.
+
+    def _next_slots(source_slots, next_pool):
+        result = []
+        for i in range(len(source_slots) // 2):
+            sh = source_slots[2 * i]
+            sa = source_slots[2 * i + 1]
+            h_ov = _winner_derived(*(sh or (None, None, None)))
+            a_ov = _winner_derived(*(sa or (None, None, None)))
+            api_m = _find_match(next_pool, h_ov, a_ov)
+            result.append((api_m, h_ov, a_ov))
+        return result
 
     l_r32_slots = [(m, None, None) for m in l_r32]
-    l_r16_slots = _make_slots(l_r16, l_r32_slots)
-    l_qf_slots  = _make_slots(l_qf,  l_r16_slots)
-    l_sf_slots  = _make_slots(l_sf,  l_qf_slots)
+    l_r16_slots = _next_slots(l_r32_slots, r16)
+    l_qf_slots  = _next_slots(l_r16_slots, qf)
+    l_sf_slots  = _next_slots(l_qf_slots,  sf)
 
     r_r32_slots = [(m, None, None) for m in r_r32]
-    r_r16_slots = _make_slots(r_r16, r_r32_slots)
-    r_qf_slots  = _make_slots(r_qf,  r_r16_slots)
-    r_sf_slots  = _make_slots(r_sf,  r_qf_slots)
+    r_r16_slots = _next_slots(r_r32_slots, r16)
+    r_qf_slots  = _next_slots(r_r16_slots, qf)
+    r_sf_slots  = _next_slots(r_qf_slots,  sf)
 
-    # Final teams derive from the two SF winners
+    # Final: derive home/away from SF winners; find API fixture by team matching
     l_sf_win = _winner_derived(*(_g(l_sf_slots, 0) or (None, None, None)))
     r_sf_win = _winner_derived(*(_g(r_sf_slots, 0) or (None, None, None)))
-    fin_m = _g(fin, 0)
+    fin_m = _find_match(fin, l_sf_win, r_sf_win) or _g(fin, 0)
     fin_h, fin_a = _isos(fin_m)
     if not fin_h: fin_h = l_sf_win
     if not fin_a: fin_a = r_sf_win
